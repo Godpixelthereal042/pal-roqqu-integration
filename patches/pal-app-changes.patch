@@ -1,0 +1,266 @@
+diff --git a/components/QuickInvoiceScreen.tsx b/components/QuickInvoiceScreen.tsx
+index 7b405af..bb646e6 100644
+--- a/components/QuickInvoiceScreen.tsx
++++ b/components/QuickInvoiceScreen.tsx
+@@ -25,9 +25,96 @@ interface Invoice {
+     timestamp: string;
+ }
+ 
++interface PaymentLink {
++    invoice_id: string;
++    payment_link: string;
++    amount_required: string;
++    status: "pending" | "paid" | "failed";
++    expires_at: string;
++    test_mode: boolean;
++}
++
++const fieldClass = "h-[44px] w-full rounded-2xl border border-[var(--app-card-border)] bg-black/40 px-4 text-xs font-semibold text-white outline-none focus:border-white/10 transition-all placeholder:text-zinc-600";
++const labelClass = "block text-[9px] font-bold text-[var(--app-text-muted)] uppercase tracking-widest mb-1.5 pl-0.5";
++const smallButtonClass = "text-[10px] font-bold px-2 py-0.5 rounded-md bg-zinc-850 text-zinc-300 border border-zinc-700 hover:text-white hover:bg-zinc-750 transition-all cursor-pointer shadow-sm active:scale-95";
++
+ export default function QuickInvoiceScreen() {
+     const { showToast } = useToast();
+ 
++    // Roqqu payment links, newest first (the server sends them in that order).
++    const [paymentLinks, setPaymentLinks] = useState<PaymentLink[]>([]);
++    const [payInvoice, setPayInvoice] = useState<Invoice | null>(null);
++    const [payEmail, setPayEmail] = useState("");
++    const [payFirstName, setPayFirstName] = useState("");
++    const [payLastName, setPayLastName] = useState("");
++    const [payAmount, setPayAmount] = useState("");
++    const [isLinking, setIsLinking] = useState(false);
++    const [newLink, setNewLink] = useState<PaymentLink | null>(null);
++
++    const linkFor = useCallback(
++        (invoiceId: string) => paymentLinks.find((l) => l.invoice_id === invoiceId) ?? null,
++        [paymentLinks]
++    );
++
++    const loadPaymentLinks = useCallback(async () => {
++        try {
++            const res = await fetch("/api/invoices/payment-links");
++            if (!res.ok) return;
++            const data = await res.json();
++            setPaymentLinks(Array.isArray(data) ? data : []);
++        } catch {
++            // Invoices still work without Roqqu.
++        }
++    }, []);
++
++    const closePayDrawer = () => {
++        setPayInvoice(null);
++        setNewLink(null);
++        setPayEmail("");
++        setPayFirstName("");
++        setPayLastName("");
++        setPayAmount("");
++    };
++
++    const copyLink = async (url: string) => {
++        try {
++            await navigator.clipboard.writeText(url);
++            showToast("Payment link copied", "success");
++        } catch {
++            showToast("Couldn't copy. Open the link and copy it from there.", "error");
++        }
++    };
++
++    const handleCreatePaymentLink = async (e: React.FormEvent) => {
++        e.preventDefault();
++        if (!payInvoice || isLinking) return;
++        setIsLinking(true);
++        try {
++            const res = await fetch("/api/invoices/payment-links", {
++                method: "POST",
++                headers: { "Content-Type": "application/json" },
++                body: JSON.stringify({
++                    invoice_id: payInvoice.id,
++                    email: payEmail,
++                    first_name: payFirstName,
++                    last_name: payLastName,
++                    amount_ngn: payAmount,
++                }),
++            });
++            const data = await res.json().catch(() => null);
++            if (!res.ok || !data?.payment_link) {
++                showToast(data?.error ?? "Couldn't create the payment link. Please try again.", "error");
++                return;
++            }
++            setNewLink(data);
++            await loadPaymentLinks();
++        } catch {
++            showToast("Couldn't reach Roqqu. Check your connection and try again.", "error");
++        } finally {
++            setIsLinking(false);
++        }
++    };
++
+     // Invoice states
+     const [invoices, setInvoices] = useState<Invoice[]>([]);
+     const [loaded, setLoaded] = useState(false);
+@@ -73,17 +160,37 @@ export default function QuickInvoiceScreen() {
+         }
+     }, []);
+ 
++    // While a client could be paying, keep checking so the invoice flips to paid on its own.
++    const hasOpenLink = useMemo(() => {
++        const now = Date.now();
++        return invoices.some((inv) => {
++            const link = paymentLinks.find((l) => l.invoice_id === inv.id);
++            return inv.status !== "paid" && link?.status === "pending" && new Date(link.expires_at).getTime() > now;
++        });
++    }, [invoices, paymentLinks]);
++
++    useEffect(() => {
++        if (!hasOpenLink) return;
++        const timer = setInterval(() => {
++            loadInvoices();
++            loadPaymentLinks();
++        }, 15000);
++        return () => clearInterval(timer);
++    }, [hasOpenLink, loadInvoices, loadPaymentLinks]);
++
+     useEffect(() => {
+         loadInvoices();
++        loadPaymentLinks();
+         fetch("/api/auth/session")
+             .then((res) => (res.ok ? res.json() : null))
+             .then((data) => setUserName(data?.user?.name ?? ""))
+             .catch(() => {});
+-    }, [loadInvoices]);
++    }, [loadInvoices, loadPaymentLinks]);
+ 
+     const handleRefresh = async () => {
+         if (isRefreshing) return;
+         setIsRefreshing(true);
++        loadPaymentLinks();
+         const ok = await loadInvoices();
+         setIsRefreshing(false);
+         showToast(ok ? "Invoices up to date" : "Couldn't load your invoices. Please try again.", ok ? "success" : "error");
+@@ -292,7 +399,20 @@ export default function QuickInvoiceScreen() {
+                                             ${parseFloat(inv.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                         </div>
+                                         <div className="flex items-center gap-1.5 mt-1.5">
+-                                            <button 
++                                            {!isPaid && (() => {
++                                                const link = linkFor(inv.id);
++                                                const open = link?.status === "pending" && new Date(link.expires_at).getTime() > Date.now();
++                                                return open && link ? (
++                                                    <button onClick={() => copyLink(link.payment_link)} className={smallButtonClass} title="Copy the Roqqu payment link">
++                                                        Copy link
++                                                    </button>
++                                                ) : (
++                                                    <button onClick={() => setPayInvoice(inv)} className={smallButtonClass} title="Create a Roqqu payment link">
++                                                        {link?.status === "failed" ? "Payment failed: new link" : "Get paid"}
++                                                    </button>
++                                                );
++                                            })()}
++                                            <button
+                                                 onClick={() => setPrintInvoice(inv)}
+                                                 className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-zinc-850 text-zinc-300 border border-zinc-700 hover:text-white hover:bg-zinc-750 transition-all cursor-pointer shadow-sm active:scale-95"
+                                                 title="Print Invoice / PDF"
+@@ -412,6 +532,91 @@ export default function QuickInvoiceScreen() {
+                 )}
+             </AnimatePresence>
+ 
++            {/* Slide-up drawer: create a Roqqu payment link for an invoice */}
++            <AnimatePresence>
++                {payInvoice && (
++                    <>
++                        <motion.div
++                            initial={{ opacity: 0 }}
++                            animate={{ opacity: 0.6 }}
++                            exit={{ opacity: 0 }}
++                            onClick={closePayDrawer}
++                            className="absolute inset-0 bg-black z-[60]"
++                        />
++                        <motion.div
++                            initial={{ y: "100%" }}
++                            animate={{ y: 0 }}
++                            exit={{ y: "100%" }}
++                            transition={{ type: "spring", damping: 25, stiffness: 220 }}
++                            className="absolute bottom-0 left-0 right-0 max-h-[85%] bg-[var(--app-card)] border-t border-[var(--app-card-border)] rounded-t-[32px] p-6 z-[60] overflow-y-auto"
++                        >
++                            <div className="flex justify-between items-center mb-2">
++                                <h3 className="text-sm font-bold text-white uppercase tracking-wider">Get paid with Roqqu</h3>
++                                <button
++                                    onClick={closePayDrawer}
++                                    aria-label="Close"
++                                    className="p-1 rounded-full bg-zinc-900 border border-[var(--app-card-border)] text-[var(--app-text-secondary)] hover:text-white"
++                                >
++                                    <X size={16} />
++                                </button>
++                            </div>
++                            <p className="text-[12px] text-[var(--app-text-secondary)] mb-4">
++                                {payInvoice.client} • {payInvoice.service} • Test mode: no real money moves.
++                            </p>
++
++                            {newLink ? (
++                                <div className="space-y-3 pb-6">
++                                    <p className="text-[13px] text-white">Send this link to your client. They pay in BTC or USDT, and PAL marks the invoice paid when Roqqu confirms it.</p>
++                                    <p className="text-[12px] text-[var(--app-text-secondary)] break-all">{newLink.payment_link}</p>
++                                    <button
++                                        onClick={() => copyLink(newLink.payment_link)}
++                                        className="w-full h-[46px] rounded-full bg-white text-black font-bold text-xs uppercase tracking-wider cursor-pointer"
++                                    >
++                                        Copy link
++                                    </button>
++                                    <a
++                                        href={newLink.payment_link}
++                                        target="_blank"
++                                        rel="noopener noreferrer"
++                                        className="w-full h-[46px] rounded-full border border-[var(--app-card-border)] text-white font-bold text-xs uppercase tracking-wider flex items-center justify-center"
++                                    >
++                                        Open payment page
++                                    </a>
++                                </div>
++                            ) : (
++                                <form onSubmit={handleCreatePaymentLink} className="space-y-4 pb-6">
++                                    <div>
++                                        <label htmlFor="pay-amount" className={labelClass}>Amount to charge (₦)</label>
++                                        <input id="pay-amount" value={payAmount} onChange={(e) => setPayAmount(e.target.value)} placeholder="50,000" inputMode="decimal" className={fieldClass} required />
++                                    </div>
++                                    <div>
++                                        <label htmlFor="pay-email" className={labelClass}>Client email</label>
++                                        <input id="pay-email" type="email" value={payEmail} onChange={(e) => setPayEmail(e.target.value)} placeholder="client@company.com" className={fieldClass} required />
++                                    </div>
++                                    <div className="grid grid-cols-2 gap-4">
++                                        <div>
++                                            <label htmlFor="pay-first" className={labelClass}>First name</label>
++                                            <input id="pay-first" value={payFirstName} onChange={(e) => setPayFirstName(e.target.value)} className={fieldClass} required />
++                                        </div>
++                                        <div>
++                                            <label htmlFor="pay-last" className={labelClass}>Last name</label>
++                                            <input id="pay-last" value={payLastName} onChange={(e) => setPayLastName(e.target.value)} className={fieldClass} required />
++                                        </div>
++                                    </div>
++                                    <button
++                                        type="submit"
++                                        disabled={isLinking}
++                                        className="w-full h-[46px] rounded-full bg-white text-black font-bold text-xs uppercase tracking-wider cursor-pointer disabled:opacity-60"
++                                    >
++                                        {isLinking ? "Creating…" : "Create payment link"}
++                                    </button>
++                                </form>
++                            )}
++                        </motion.div>
++                    </>
++                )}
++            </AnimatePresence>
++
+             {/* Hidden printable receipt for window.print() */}
+             {printInvoice && (
+                 <div className="printable-invoice font-outfit" style={{ display: 'none' }}>
+diff --git a/middleware.ts b/middleware.ts
+index 2de7ad4..e2ed78a 100644
+--- a/middleware.ts
++++ b/middleware.ts
+@@ -24,6 +24,7 @@ export async function middleware(request: NextRequest) {
+         pathname.startsWith("/api/auth") ||
+         pathname.startsWith("/api/health") ||
+         pathname === "/api/waitlist" ||
++        pathname === "/api/webhooks/roqqu" ||
+         pathname === "/waitlist" ||
+         pathname === "/privacy" ||
+         pathname === "/terms" ||
